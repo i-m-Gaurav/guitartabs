@@ -28,6 +28,9 @@
     songs: 'tabvault.songs.v1',
     draft: 'tabvault.draft.v1',
     settings: 'tabvault.settings.v1',
+    lastSync: 'tabvault.lastSync.v1',
+    pendingDeletes: 'tabvault.pendingDeletes.v1',
+    apiKey: 'tabvault.apiKey.v1',
   };
 
   /** Order of strings in tablature, top line → bottom line. */
@@ -269,6 +272,7 @@
     list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
     tab: '<path d="M3 5h18M3 9.5h18M3 14h18M3 18.5h18"/>',
     section: '<path d="M4 6h16M4 10h10M4 18h16M4 14h10"/><path d="m17 11 3 3-3 3"/>',
+    sync: '<path d="M20 11a8 8 0 0 0-14.9-3M4 13a8 8 0 0 0 14.9 3"/><path d="M5 3v5h5M19 21v-5h-5"/>',
     undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
     insert: '<rect x="3" y="3" width="18" height="18" rx="3"/><path d="M12 8v8M8 12h8"/>',
     end: '<path d="m6 17 5-5-5-5M13 17l5-5-5-5"/>',
@@ -451,6 +455,7 @@
       mutator(this.songs);
       if (!this.persist()) { this.songs = prev; return false; }
       updateSidebarCount();
+      Sync.trackChanges(prev, this.songs);
       return true;
     },
 
@@ -482,7 +487,8 @@
       if (!s) return;
       const prev = s.lastOpenedAt;
       s.lastOpenedAt = new Date().toISOString();
-      try { lsSet(KEYS.songs, JSON.stringify(this.songs)); } catch (_) { s.lastOpenedAt = prev; }
+      try { lsSet(KEYS.songs, JSON.stringify(this.songs)); } catch (_) { s.lastOpenedAt = prev; return; }
+      Sync.queueUpsert(id);
     },
   };
 
@@ -539,8 +545,267 @@
 
   function updateSidebarCount() {
     const el = $('#sidebar-count');
-    if (el) el.textContent = `${plural(Store.all().length, 'song')} saved locally`;
+    if (el) el.textContent = `${plural(Store.all().length, 'song')} · ${syncStatusText()}`;
+    const dot = $('.storage-pill .dot');
+    if (dot) dot.className = `dot sync-${Sync.status}`;
   }
+
+  /* =========================================================
+   * Cloud sync (MongoDB via /api/songs)
+   *
+   * Offline-first: the app always reads and writes the local copy in
+   * LocalStorage, so it stays instant and works without a connection.
+   * Every change is then pushed to the server in the background, and the
+   * library is pulled (and merged) on load, when the tab regains focus and
+   * when the device comes back online. When the page is opened without a
+   * server (file://, or a host with no API) it simply stays local-only.
+   * ======================================================= */
+  const API_URL = 'api/songs';
+
+  const Sync = {
+    available: location.protocol === 'http:' || location.protocol === 'https:',
+    status: 'local',     // local | syncing | synced | offline | locked | error
+    lastSync: 0,         // client time of the last successful pull + merge
+    lastPullAt: 0,
+    upserts: new Set(),  // song ids waiting to be uploaded
+    deletes: new Set(),  // song ids waiting to be deleted on the server (persisted)
+    chain: Promise.resolve(),
+    timer: null,
+    retryTimer: null,
+    prompting: false,
+    promptDismissed: false,
+    errorShown: false,
+
+    init() {
+      this.lastSync = Number(lsGet(KEYS.lastSync)) || 0;
+      try { (JSON.parse(lsGet(KEYS.pendingDeletes) || '[]') || []).forEach((id) => this.deletes.add(String(id))); } catch (_) { /* ignore */ }
+      if (!this.available) { this.setStatus('local'); return; }
+      this.pull();
+      window.addEventListener('online', () => this.pull());
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && Date.now() - this.lastPullAt > 30000) this.pull();
+      });
+    },
+
+    setStatus(status) {
+      this.status = status;
+      updateSidebarCount();
+      const el = $('#sync-status');
+      if (el) el.innerHTML = syncStatusHTML();
+    },
+
+    key() { return lsGet(KEYS.apiKey) || ''; },
+
+    async request(method, body) {
+      let res;
+      try {
+        res = await fetch(API_URL, {
+          method,
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json', 'X-TabVault-Key': encodeURIComponent(this.key()) },
+          body: body ? JSON.stringify(body) : undefined,
+        });
+      } catch (_) {
+        throw Object.assign(new Error('You appear to be offline.'), { code: 'offline' });
+      }
+      if (res.status === 401) throw Object.assign(new Error('Password required'), { code: 'locked' });
+      const isJson = (res.headers.get('content-type') || '').includes('application/json');
+      // No API on this host (e.g. a purely static host): stay local-only.
+      if (!isJson && (res.status === 404 || res.status === 405 || res.ok)) throw Object.assign(new Error('No sync server'), { code: 'local' });
+      const data = isJson ? await res.json().catch(() => null) : null;
+      if (!res.ok) throw Object.assign(new Error((data && data.error) || `Server error (${res.status})`), { code: 'error' });
+      return data;
+    },
+
+    /** Called by Store.commit with the library before and after a change. */
+    trackChanges(prev, next) {
+      const before = new Map(prev.map((s) => [s.id, s]));
+      const after = new Set();
+      next.forEach((s) => {
+        after.add(s.id);
+        if (before.get(s.id) !== s) { this.upserts.add(s.id); this.deletes.delete(s.id); }
+      });
+      prev.forEach((s) => {
+        if (!after.has(s.id)) { this.deletes.add(s.id); this.upserts.delete(s.id); }
+      });
+      this.saveDeletes();
+      this.schedule();
+    },
+
+    queueUpsert(id) {
+      this.upserts.add(id);
+      this.schedule();
+    },
+
+    saveDeletes() {
+      try { lsSet(KEYS.pendingDeletes, JSON.stringify([...this.deletes])); } catch (_) { /* ignore */ }
+    },
+
+    schedule() {
+      if (!this.available) return;
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => { this.chain = this.chain.then(() => this.flush()); }, 400);
+    },
+
+    /** Upload queued changes. */
+    async flush() {
+      if (!this.available || this.status === 'locked' || this.status === 'local' && this.lastPullAt) return;
+      const dels = [...this.deletes];
+      const ups = [...this.upserts].map((id) => Store.get(id)).filter(Boolean);
+      if (!dels.length && !ups.length) return;
+      this.upserts.clear();
+      this.setStatus('syncing');
+      try {
+        if (dels.length) {
+          await this.request('DELETE', { ids: dels });
+          dels.forEach((id) => this.deletes.delete(id));
+          this.saveDeletes();
+        }
+        for (let i = 0; i < ups.length; i += 200) await this.request('PUT', { songs: ups.slice(i, i + 200) });
+        this.setStatus('synced');
+        this.errorShown = false;
+      } catch (err) {
+        ups.forEach((s) => this.upserts.add(s.id)); // keep them for the next attempt
+        this.fail(err);
+      }
+    },
+
+    pull() {
+      if (!this.available) return Promise.resolve();
+      this.chain = this.chain.then(() => this.doPull());
+      return this.chain;
+    },
+
+    /** Download the library and merge it with this device's copy. */
+    async doPull() {
+      if (this.status === 'locked' && this.promptDismissed) return;
+      const startedAt = Date.now();
+      this.lastPullAt = startedAt;
+      this.setStatus('syncing');
+      try {
+        if (this.deletes.size) {
+          const dels = [...this.deletes];
+          await this.request('DELETE', { ids: dels });
+          dels.forEach((id) => this.deletes.delete(id));
+          this.saveDeletes();
+        }
+        const data = await this.request('GET');
+        const server = (data && Array.isArray(data.songs) ? data.songs : []).map((s) => normalizeSong(s)).filter(Boolean);
+        const changed = this.merge(server);
+        this.lastSync = startedAt;
+        try { lsSet(KEYS.lastSync, String(startedAt)); } catch (_) { /* ignore */ }
+        this.setStatus('synced');
+        this.errorShown = false;
+        if (this.upserts.size) await this.flush();
+        if (changed) onRemoteChange();
+      } catch (err) {
+        this.fail(err);
+      }
+    },
+
+    /**
+     * Merge server songs into the local library. The newest version of each song wins.
+     * A song only on this device is uploaded if it was changed since the last sync,
+     * otherwise it was deleted on another device and is removed here too.
+     */
+    merge(server) {
+      const t = (v) => (v ? new Date(v).getTime() || 0 : 0);
+      const remote = new Map(server.map((s) => [s.id, s]));
+      const merged = [];
+      Store.all().forEach((local) => {
+        const r = remote.get(local.id);
+        if (r) {
+          remote.delete(local.id);
+          if (t(local.updatedAt) > t(r.updatedAt)) { merged.push(local); this.upserts.add(local.id); }
+          else {
+            if (t(local.lastOpenedAt) > t(r.lastOpenedAt)) r.lastOpenedAt = local.lastOpenedAt;
+            merged.push(r);
+          }
+        } else if (!this.lastSync || t(local.updatedAt) > this.lastSync || this.upserts.has(local.id)) {
+          merged.push(local); // new on this device (or edited offline) → upload
+          this.upserts.add(local.id);
+        }
+        // else: deleted on another device → drop it here as well
+      });
+      remote.forEach((r) => { if (!this.deletes.has(r.id)) merged.push(r); });
+
+      const sig = (list) => list.map((s) => `${s.id}@${s.updatedAt}@${s.lastOpenedAt || ''}`).sort().join('|');
+      const changed = sig(merged) !== sig(Store.all());
+      if (changed) {
+        Store.songs = merged;
+        try { lsSet(KEYS.songs, JSON.stringify(merged)); } catch (_) { /* local cache full; the server still has everything */ }
+        updateSidebarCount();
+      }
+      return changed;
+    },
+
+    fail(err) {
+      const code = err && err.code;
+      if (code === 'local') { this.setStatus('local'); return; }
+      if (code === 'locked') { this.setStatus('locked'); if (!this.promptDismissed) promptForPassword(); return; }
+      this.setStatus(code === 'offline' ? 'offline' : 'error');
+      if (code !== 'offline' && !this.errorShown) {
+        this.errorShown = true;
+        toast(`Cloud sync failed: ${err.message}. Your changes are safe on this device and will sync automatically.`, 'error', { duration: 7000 });
+      }
+      clearTimeout(this.retryTimer);
+      this.retryTimer = setTimeout(() => this.pull(), 30000);
+    },
+  };
+
+  function syncStatusText() {
+    switch (Sync.status) {
+      case 'syncing': return 'Saving to cloud…';
+      case 'synced': return 'Synced to cloud';
+      case 'offline': return 'Offline — will sync later';
+      case 'locked': return 'Cloud locked — enter password';
+      case 'error': return 'Sync problem — retrying';
+      default: return 'Saved on this device';
+    }
+  }
+
+  function syncStatusHTML() {
+    const when = Sync.lastSync ? ` · last synced ${esc(timeAgo(new Date(Sync.lastSync).toISOString()))}` : '';
+    return `<span class="sync-dot sync-${Sync.status}"></span><span>${esc(syncStatusText())}${Sync.status === 'synced' || Sync.status === 'offline' ? when : ''}</span>`;
+  }
+
+  async function promptForPassword() {
+    if (Sync.prompting) return;
+    Sync.prompting = true;
+    const hadKey = !!Sync.key();
+    const choice = await openModal({
+      title: 'Unlock your library',
+      body: `
+        <p>Your TabVault library is password-protected. Enter the password set as <code>APP_PASSWORD</code> on your server — this device will remember it.</p>
+        ${hadKey ? '<p class="text-danger">That password didn’t work. Please try again.</p>' : ''}
+        <input class="input" id="sync-password" type="password" autocomplete="current-password" placeholder="Password" data-autofocus>`,
+      actions: [
+        { label: 'Not now', value: null, variant: 'ghost' },
+        { label: 'Unlock', value: 'unlock', variant: 'primary' },
+      ],
+    });
+    const input = $('#sync-password');
+    const value = input ? input.value : '';
+    Sync.prompting = false;
+    if (choice !== 'unlock' || !value) {
+      Sync.promptDismissed = true;
+      toast('Working offline — your changes are saved on this device until you unlock.', 'info', { duration: 4000 });
+      return;
+    }
+    try { lsSet(KEYS.apiKey, value); } catch (_) { /* ignore */ }
+    Sync.status = 'syncing';
+    Sync.pull();
+  }
+
+  /** Re-render after the library changed on another device, without disturbing the user. */
+  function onRemoteChange() {
+    if (!currentRoute || state.practice || modalOpen()) { updateSidebarCount(); return; }
+    if (isEditorRoute(currentRoute)) { updateSidebarCount(); return; }
+    const active = document.activeElement;
+    if (active && $('#view').contains(active) && isTypingTarget(active)) { updateSidebarCount(); return; }
+    render({ keepScroll: true });
+  }
+
 
   /* =========================================================
    * 5. UI primitives
@@ -610,6 +875,10 @@
       function onKey(e) {
         e.stopPropagation();
         if (e.key === 'Escape' && dismissible) { e.preventDefault(); close(null); return; }
+        if (e.key === 'Enter' && e.target.tagName === 'INPUT') {
+          const main = $('.modal-actions .btn.primary', wrap);
+          if (main) { e.preventDefault(); main.click(); return; }
+        }
         if (e.key === 'Tab') {
           const items = $$('button, [href], input, select, textarea', wrap).filter((x) => !x.disabled);
           if (!items.length) return;
@@ -982,6 +1251,9 @@
   }
 
   function emptyLibrary() {
+    if (Sync.available && !Sync.lastSync && Sync.status === 'syncing') {
+      return `<div class="empty-state small"><h2>Loading your library…</h2><p>Fetching your songs from the cloud.</p></div>`;
+    }
     return `
       <div class="empty-state">
         <div class="empty-art">${renderTabBlock({ tuning: 'Standard E' }, [
@@ -1235,8 +1507,22 @@
       </section>
 
       <section class="card settings-card">
+        <h2 class="card-title">Cloud sync</h2>
+        <p class="muted">${Sync.available
+          ? 'Your songs are saved to your online database and stay in sync on every device where you open TabVault. This device also keeps a copy, so the app works offline and catches up when you reconnect.'
+          : 'Cloud sync works when TabVault is opened from your website. Opened as a local file, songs are saved in this browser only.'}</p>
+        <div class="sync-status" id="sync-status">${syncStatusHTML()}</div>
+        ${Sync.available ? `
+          <div class="button-row">
+            <button type="button" class="btn" data-action="sync-now">${icon('sync')} Sync now</button>
+            ${Sync.status === 'locked' || Sync.key() ? `<button type="button" class="btn ghost" data-action="sync-unlock">${Sync.status === 'locked' ? 'Enter password' : 'Change password'}</button>` : ''}
+            ${Sync.key() ? '<button type="button" class="btn ghost" data-action="sync-forget">Forget password on this device</button>' : ''}
+          </div>` : ''}
+      </section>
+
+      <section class="card settings-card">
         <h2 class="card-title">Backup &amp; restore</h2>
-        <p class="muted">Your songs are saved in this browser only. Export a backup regularly, and use it to move your library to another device or browser.</p>
+        <p class="muted">${Sync.available ? 'Your library is synced to the cloud, but a JSON backup is still a good safety net — export one now and then.' : 'Your songs are saved in this browser only. Export a backup regularly, and use it to move your library to another device or browser.'}</p>
         <div class="button-row">
           <button type="button" class="btn primary" data-action="export">${icon('download')} Export collection (JSON)</button>
           <button type="button" class="btn" data-action="import">${icon('upload')} Import from JSON</button>
@@ -2825,6 +3111,18 @@
     export: () => exportData(),
     import: () => $('#import-file').click(),
     'clear-all': () => clearAll(),
+    'sync-now': () => {
+      Sync.promptDismissed = false;
+      Sync.errorShown = false;
+      if (Sync.status === 'locked') { promptForPassword(); return; }
+      Sync.pull().then(() => { if (Sync.status === 'synced') toast('Library synced', 'success', { duration: 1500 }); });
+    },
+    'sync-unlock': () => { Sync.promptDismissed = false; try { localStorage.removeItem(KEYS.apiKey); } catch (_) { /* ignore */ } promptForPassword(); },
+    'sync-forget': () => {
+      try { localStorage.removeItem(KEYS.apiKey); } catch (_) { /* ignore */ }
+      toast('Password removed from this device', 'info');
+      Sync.pull().then(() => { if (currentRoute && currentRoute.name === 'settings') render({ keepScroll: true }); });
+    },
 
     // detail page
     'detail-view': (el) => {
@@ -3051,6 +3349,7 @@
     if (!location.hash || location.hash === '#' || location.hash === '#/') replaceHash('#/dashboard');
     lastHash = location.hash;
     render();
+    Sync.init();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
