@@ -6,7 +6,7 @@
  * On Vercel you don't need this file — api/songs.js is used instead.
  *
  * Reads settings from environment variables, or from a local .env file:
- *   MONGODB_URII=...   APP_PASSWORD=...   PORT=3000
+ *   MONGODB_URI=...   APP_PASSWORD=...   PORT=3000
  */
 
 const http = require('http');
@@ -46,7 +46,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`TabVault running at http://localhost:${PORT}`);
-  if (!process.env.MONGODB_URII) console.warn('Warning: MONGODB_URII is not set — the app will work offline only.');
+  if (!process.env.MONGODB_URI) console.warn('Warning: MONGODB_URI is not set — the app will work offline only.');
   if (!process.env.APP_PASSWORD) console.warn('Note: APP_PASSWORD is not set — anyone who can reach this server can edit your songs.');
 });
 

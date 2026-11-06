@@ -1,0 +1,20 @@
+# Netlify configuration for TabVault.
+# The site is just three static files; the API runs as a Netlify Function at /api/songs.
+
+[build]
+  # Publish only the app files (not node_modules, server code or config).
+  command = "mkdir -p dist && cp index.html style.css script.js dist/"
+  publish = "dist"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  # Ship the MongoDB driver as a normal dependency instead of bundling it.
+  external_node_modules = ["mongodb"]
+
+# The app calls /api/songs; serve it from the function.
+[[redirects]]
+  from = "/api/songs"
+  to = "/.netlify/functions/songs"
+  status = 200
+  force = true

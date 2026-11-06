@@ -12,11 +12,22 @@ Plain HTML, CSS and JavaScript on the front end. Songs are saved in the browser 
 
 The MongoDB connection string lives **only** in environment variables on the server. It is never in the front-end code (anything in `script.js` is public).
 
-## Deploy on Vercel (recommended)
+## Deploy on Netlify
+
+`netlify.toml` already configures everything: the app is published from `dist/`, and `netlify/functions/songs.js` is served at `/api/songs`.
+
+1. Netlify → your site → **Site configuration → Environment variables**, add:
+   - `MONGODB_URI` – your MongoDB connection string
+   - `APP_PASSWORD` – a password of your choice (the app asks for it once per device)
+2. Push to GitHub (or **Deploys → Trigger deploy → Deploy site**). Environment variables only apply to new deploys.
+3. In MongoDB Atlas → **Network Access**, allow access from anywhere (`0.0.0.0/0`) — Netlify's servers don't have fixed IP addresses.
+4. Check `https://<your-site>/api/songs` in a browser: `{"error":"Password required"}` means it's working.
+
+## Deploy on Vercel
 
 1. Import the GitHub repo in Vercel (Framework preset: **Other**, no build command).
 2. Project → **Settings → Environment Variables**, add:
-   - `MONGODB_URII` – your MongoDB connection string
+   - `MONGODB_URI` – your MongoDB connection string
    - `APP_PASSWORD` – a password of your choice (the app asks for it once per device)
 3. Redeploy. The app is served from the repo root and `api/songs.js` becomes `/api/songs`.
 4. In MongoDB Atlas → **Network Access**, allow access from anywhere (`0.0.0.0/0`), because Vercel's servers don't have fixed IP addresses.
@@ -25,13 +36,13 @@ The MongoDB connection string lives **only** in environment variables on the ser
 
 ```bash
 npm install
-MONGODB_URII="..." APP_PASSWORD="..." npm start   # serves the app + API on $PORT (default 3000)
+MONGODB_URI="..." APP_PASSWORD="..." npm start   # serves the app + API on $PORT (default 3000)
 ```
 
 ## Run locally
 
 ```bash
-cp .env.example .env   # then fill in MONGODB_URII and APP_PASSWORD
+cp .env.example .env   # then fill in MONGODB_URI and APP_PASSWORD
 npm install
 npm start              # http://localhost:3000
 ```
